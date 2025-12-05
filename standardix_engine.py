@@ -64,9 +64,8 @@ def apply_rules(series, exact_en, exact_fr, regex_rules):
     out_fr = []
 
     for v in series:
-        # 🔹 NOUVEAU : gérer les vrais blancs
-        if v is None or (isinstance(v, str) and v.strip() == ""):
-            # On laisse la cellule vide dans EN et FR
+        # 🔹 VRAIS BLANCS (Excel -> NaN, ou chaîne vide) → on laisse vide
+        if pd.isna(v) or (isinstance(v, str) and v.strip() == ""):
             out_en.append("")
             out_fr.append("")
             continue
@@ -82,12 +81,11 @@ def apply_rules(series, exact_en, exact_fr, regex_rules):
                     en, fr = sen, sfr
                     break
 
-        # Valeur non vide mais pas trouvée → libellé "non mappé"
-        out_en.append(en if en else "UNMAPPED")      # ou "UNDEFINED" / "UNDEFINITE"
-        out_fr.append(fr if fr else "NON_MAPPÉ")
+        # 🔹 Valeur présente mais non trouvée dans le mapping
+        out_en.append(en if en is not None else "UNDEFINITE")
+        out_fr.append(fr if fr is not None else "NON_MAPPÉ")
 
     return out_en, out_fr
-
 
 
 def standardix(products_file, mapping_file):
