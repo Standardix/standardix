@@ -60,11 +60,17 @@ def build_rules(df_map, attribute):
 
 
 def apply_rules(series, exact_en, exact_fr, regex_rules):
-    """Applique les règles à une série et renvoie 2 listes (EN, FR)."""
     out_en = []
     out_fr = []
 
     for v in series:
+        # 🔹 NOUVEAU : gérer les vrais blancs
+        if v is None or (isinstance(v, str) and v.strip() == ""):
+            # On laisse la cellule vide dans EN et FR
+            out_en.append("")
+            out_fr.append("")
+            continue
+
         norm = clean_text(v)
         en = exact_en.get(norm)
         fr = exact_fr.get(norm)
@@ -76,10 +82,12 @@ def apply_rules(series, exact_en, exact_fr, regex_rules):
                     en, fr = sen, sfr
                     break
 
-        out_en.append(en if en else "UNMAPPED")
+        # Valeur non vide mais pas trouvée → libellé "non mappé"
+        out_en.append(en if en else "UNMAPPED")      # ou "UNDEFINED" / "UNDEFINITE"
         out_fr.append(fr if fr else "NON_MAPPÉ")
 
     return out_en, out_fr
+
 
 
 def standardix(products_file, mapping_file):
