@@ -1,59 +1,79 @@
 import pandas as pd
 import re
-from pathlib import Path
+
+
+def read_table(file_like):
+    """Lit un CSV ou un Excel (xlsx/xls) en fonction de l'extension."""
+    name = getattr(file_like, "name", "").lower()
+
+    if name.endswith((".xlsx", ".xls")):
+        df = pd.read_excel(file_like, dtype=str)
+    else:
+        # On suppose CSV par défaut
+        df = pd.read_csv(file_like, dtype=str, sep=None, engine="python")
+
+    # Nettoyage des noms de colonnes
+    df.columns = [col.strip().lstrip("\ufeff") for col in df.columns]
+    return df
+
 
 def clean_text(val):
     if pd.isna(val):
         return None
     return str(val).strip().lower()
 
-def load_mapping(mapping_file):
-    df_map = pd.read_csv(mapping_file, dtype=str, sep=None, engine="python")
-    df_map.columns = [col.strip().lstrip("\ufeff") for col in df_map.columns]
 
-    if "match_type" not in df_map.columns:
-        df_map["match_type"] = "exact"
-
-    required_cols = {"attribute","source","standard_en","standard_fr","match_type"}
-    if not required_cols.issubset(df_map.columns):
-        raise ValueError(f"Missing columns in mapping file")
-
+def load_mapping(df_map):
+    """Valide et prépare le fichier de mapping déjà chargé en DataFrame."""
+    required_cols = {"attribute", "source", "standard_en", "standard_fr", "match_type"}
+    missing = required_cols - set(df_map.columns)
+    if missing:
+        raise ValueError(f"Colonnes manquantes dans le mapping : {missing}")
     return df_map
 
+
 def build_rules(df_map, attribute):
+    """Construit les règles pour un attribut donné (size, color, etc.)."""
     df = df_map[df_map["attribute"] == attribute].copy()
     if df.empty:
         return {}, {}, []
 
     df["source_norm"] = df["source"].apply(clean_text)
-    exact = df[df["match_type"] == "exact"]
-    regex = df[df["match_type"] == "regex"]
 
-    exact_en = dict(zip(exact["source_norm"], exact["standard_en"]))
-    exact_fr = dict(zip(exact["source_norm"], exact["standard_fr"]))
+    df_exact = df[df["match_type"] == "exact"]
+    df_regex = df[df["match_type"] == "regex"]
+
+    exact_en = dict(zip(df_exact["source_norm"], df_exact["standard_en"]))
+    exact_fr = dict(zip(df_exact["source_norm"], df_exact["standard_fr"]))
 
     regex_rules = []
-    for _, row in regex.iterrows():
+    for _, row in df_regex.iterrows():
+        pattern_text = row["source_norm"]
         try:
-            pattern = re.compile(row["source_norm"])
+            pattern = re.compile(pattern_text)
             regex_rules.append((pattern, row["standard_en"], row["standard_fr"]))
-        except:
-            pass
+        except re.error:
+            # On ignore les regex invalides
+            continue
 
     return exact_en, exact_fr, regex_rules
 
+
 def apply_rules(series, exact_en, exact_fr, regex_rules):
-    out_en, out_fr = [], []
-    for val in series:
-        norm = clean_text(val)
+    """Applique les règles à une série et renvoie 2 listes (EN, FR)."""
+    out_en = []
+    out_fr = []
+
+    for v in series:
+        norm = clean_text(v)
         en = exact_en.get(norm)
         fr = exact_fr.get(norm)
 
-        # regex fallback
+        # Si pas de match exact, on teste les regex
         if en is None and norm:
-            for (pattern, e, f) in regex_rules:
+            for pattern, sen, sfr in regex_rules:
                 if pattern.fullmatch(norm):
-                    en, fr = e, f
+                    en, fr = sen, sfr
                     break
 
         out_en.append(en if en else "UNMAPPED")
@@ -61,29 +81,42 @@ def apply_rules(series, exact_en, exact_fr, regex_rules):
 
     return out_en, out_fr
 
+
 def standardix(products_file, mapping_file):
-    df_products = pd.read_csv(products_file, dtype=str, sep=None, engine="python")
-    df_products.columns = [col.strip().lstrip("\ufeff") for col in df_products.columns]
+    """
+    Point d'entrée principal :
+    - products_file : CSV/XLSX fournisseur
+    - mapping_file : CSV/XLSX mapping
+    Renvoie deux DataFrames : (df_en, df_fr).
+    """
+    # Lecture des fichiers
+    df_products = read_table(products_file)
+    df_map = read_table(mapping_file)
 
-    df_map = load_mapping(mapping_file)
+    # S'assurer que match_type existe
+    if "match_type" not in df_map.columns:
+        df_map["match_type"] = "exact"
+    df_map["match_type"] = df_map["match_type"].fillna("exact").str.lower()
 
+    df_map = load_mapping(df_map)
+
+    # Attributs gérés
     attributes = [
         ("size", "size_supplier"),
         ("color", "color_supplier"),
         ("material", "material_supplier"),
-        ("gender", "gender_supplier")
+        ("gender", "gender_supplier"),
     ]
 
-    # copies for EN/FR sheets
     df_en = df_products.copy()
     df_fr = df_products.copy()
 
-    for attr, src in attributes:
-        if src not in df_products.columns:
+    for attr, src_col in attributes:
+        if src_col not in df_products.columns:
             continue
 
         exact_en, exact_fr, regex_rules = build_rules(df_map, attr)
-        std_en, std_fr = apply_rules(df_products[src], exact_en, exact_fr, regex_rules)
+        std_en, std_fr = apply_rules(df_products[src_col], exact_en, exact_fr, regex_rules)
 
         df_en[f"{attr}_standard_en"] = std_en
         df_fr[f"{attr}_standard_fr"] = std_fr
