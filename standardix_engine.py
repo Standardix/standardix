@@ -33,7 +33,7 @@ def load_mapping(df_map):
 
 
 def build_rules(df_map, attribute):
-    """Construit les règles pour un attribut donné (size, color, etc.)."""
+    """Construit les règles pour un attribut donné."""
     df = df_map[df_map["attribute"] == attribute].copy()
     if df.empty:
         return {}, {}, []
@@ -53,7 +53,7 @@ def build_rules(df_map, attribute):
             pattern = re.compile(pattern_text)
             regex_rules.append((pattern, row["standard_en"], row["standard_fr"]))
         except re.error:
-            # On ignore les regex invalides
+            # Ignore les regex invalides
             continue
 
     return exact_en, exact_fr, regex_rules
@@ -64,7 +64,7 @@ def apply_rules(series, exact_en, exact_fr, regex_rules):
     out_fr = []
 
     for v in series:
-        # 🔹 VRAIS BLANCS (Excel -> NaN, ou chaîne vide) → on laisse vide
+        # 🔹 Valeurs vides → on laisse vide
         if pd.isna(v) or (isinstance(v, str) and v.strip() == ""):
             out_en.append("")
             out_fr.append("")
@@ -74,7 +74,7 @@ def apply_rules(series, exact_en, exact_fr, regex_rules):
         en = exact_en.get(norm)
         fr = exact_fr.get(norm)
 
-        # Si pas de match exact, on teste les regex
+        # 🔹 Si pas de match exact → tester les regex
         if en is None and norm:
             for pattern, sen, sfr in regex_rules:
                 if pattern.fullmatch(norm):
@@ -93,7 +93,7 @@ def standardix(products_file, mapping_file):
     Point d'entrée principal :
     - products_file : CSV/XLSX fournisseur
     - mapping_file : CSV/XLSX mapping
-    Renvoie deux DataFrames : (df_en, df_fr).
+    Renvoie deux DataFrames : df_en, df_fr.
     """
     # Lecture des fichiers
     df_products = read_table(products_file)
@@ -105,26 +105,34 @@ def standardix(products_file, mapping_file):
     df_map["match_type"] = df_map["match_type"].fillna("exact").str.lower()
 
     df_map = load_mapping(df_map)
+    df_map["attribute"] = df_map["attribute"].astype(str).str.strip()
 
-    # Attributs gérés
-    attributes = [
-        ("size", "size_supplier"),
-        ("color", "color_supplier"),
-        ("material", "material_supplier"),
-        ("gender", "gender_supplier"),
-    ]
+    # 🔹 Lookup insensible à la casse pour les colonnes produits
+    product_cols = list(df_products.columns)
+    col_lookup = {c.strip().lower(): c for c in product_cols}
+
+    # 🔹 Attributs dynamiques : viennent du mapping
+    attribute_names = sorted(df_map["attribute"].dropna().unique())
 
     df_en = df_products.copy()
     df_fr = df_products.copy()
 
-    for attr, src_col in attributes:
-        if src_col not in df_products.columns:
+    for attr in attribute_names:
+        key = str(attr).strip()
+        if not key:
+            continue
+
+        # On cherche la colonne produit correspondante, sans tenir compte de la casse
+        src_col = col_lookup.get(key.lower())
+        if not src_col:
+            # Attribut présent dans le mapping mais pas dans le fichier produits
             continue
 
         exact_en, exact_fr, regex_rules = build_rules(df_map, attr)
         std_en, std_fr = apply_rules(df_products[src_col], exact_en, exact_fr, regex_rules)
 
-        df_en[f"{attr}_standard_en"] = std_en
-        df_fr[f"{attr}_standard_fr"] = std_fr
+        # 🔹 On nomme les colonnes standard à partir du NOM RÉEL de la colonne produit
+        df_en[f"{src_col}_standard_en"] = std_en
+        df_fr[f"{src_col}_standard_fr"] = std_fr
 
     return df_en, df_fr
