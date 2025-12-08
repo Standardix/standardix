@@ -106,10 +106,8 @@ def apply_rules(series, exact_en, exact_fr, regex_rules):
 
 # ==========================================================
 # 3. LOGIQUE SPÉCIFIQUE MESURES (pouces / cm)
-#    → inspiré de standardize_measurements.py
 # ==========================================================
 
-# Alias de valeurs pour détecter les unités en texte libre
 UNIT_ALIASES = {
     "in": ["in", "inch", "inches", '"', "po", "pouce", "pouces"],
     "ft": ["ft", "foot", "feet", "'"],
@@ -123,29 +121,54 @@ def detect_inline_unit(text: str):
     """Essaie de détecter l'unité dans une chaîne libre (in, po, cm, etc.)."""
     t = text.strip()
     tl = t.lower()
-    # Si ' et " apparaissent → très probablement pied-pouce, mais on va traiter en pouces
+
+    # Si ' et " apparaissent → très probablement pied-pouce
     if ("'" in t) and ('"' in t):
         return "ft"
+
     for canon, aliases in UNIT_ALIASES.items():
         for a in aliases:
             if a in ["'", '"']:
                 if a in t:
                     return canon
             else:
+                # 1) Cas classique : unité séparée (avec espaces)
                 if re.search(rf'\b{re.escape(a)}\b', tl, flags=re.IGNORECASE):
                     return canon
+
+                # 2) Cas "7.69in" ou "45cm" (unité collée après le nombre)
+                if tl.endswith(a.lower()):
+                    prefix = tl[:-len(a)].rstrip()
+                    if prefix and prefix[-1].isdigit():
+                        return canon
     return None
 
 
 def remove_units_case_insensitive(text: str):
     """Retire les tokens d'unités connus (mots et symboles) sans tenir compte de la casse."""
     t = text
+
     for canon, aliases in UNIT_ALIASES.items():
         for a in aliases:
             if a in ["'", '"']:
                 t = t.replace(a, "")
             else:
+                # 1) Cas classique : unité séparée (avec espaces)
                 t = re.sub(rf'\b{re.escape(a)}\b', '', t, flags=re.IGNORECASE)
+
+                # 2) Cas "7.69in" ou "45cm" (unité collée après le nombre)
+                lower_a = a.lower()
+                tl = t.lower()
+                if tl.endswith(lower_a):
+                    prefix = t[:-len(a)]
+                    # on regarde le dernier caractère non-espace avant l'unité
+                    i = len(prefix) - 1
+                    while i >= 0 and prefix[i].isspace():
+                        i -= 1
+                    if i >= 0 and prefix[i].isdigit():
+                        # on coupe l'unité (on garde le nombre + éventuels espaces avant)
+                        t = prefix[:i+1]
+
     return t
 
 
@@ -382,7 +405,7 @@ def standardize_measurement_series(series, options):
     Standardise une série de valeurs de mesures :
     - valeurs vides → vide
     - valeurs non parseables → UNDEFINITE / NON_MAPPÉ
-    - valeurs valides → 'pouces en fraction (cm)' ou autre selon options
+    - valeurs valides → format défini dans options
     """
     mode_format = options.get("mode_format", "fraction")  # 'fraction' ou 'decimale'
     dec_places = int(options.get("dec_places", 2))
@@ -515,4 +538,3 @@ def standardix(products_file, mapping_file, measure_options=None):
         df_fr[f"{src_col}_standard_fr"] = std_fr
 
     return df_en, df_fr
-
