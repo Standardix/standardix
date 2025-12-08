@@ -1,6 +1,13 @@
 import pandas as pd
 import re
+import math
+from fractions import Fraction
+from decimal import Decimal, ROUND_HALF_UP
 
+
+# ==========================================================
+# 1. Helpers GENERIQUES
+# ==========================================================
 
 def read_table(file_like):
     """Lit un CSV ou un Excel (xlsx/xls) en fonction de l'extension."""
@@ -32,8 +39,12 @@ def load_mapping(df_map):
     return df_map
 
 
+# ==========================================================
+# 2. LOGIQUE DE MAPPING CLASSIQUE (exact / regex)
+# ==========================================================
+
 def build_rules(df_map, attribute):
-    """Construit les règles pour un attribut donné."""
+    """Construit les règles pour un attribut donné (exact/regex)."""
     df = df_map[df_map["attribute"] == attribute].copy()
     if df.empty:
         return {}, {}, []
@@ -60,6 +71,11 @@ def build_rules(df_map, attribute):
 
 
 def apply_rules(series, exact_en, exact_fr, regex_rules):
+    """
+    Applique les règles exact/regex pour une série de valeurs.
+    - Valeurs vides → vide
+    - Valeurs non trouvées → UNDEFINITE / NON_MAPPÉ
+    """
     out_en = []
     out_fr = []
 
@@ -88,13 +104,365 @@ def apply_rules(series, exact_en, exact_fr, regex_rules):
     return out_en, out_fr
 
 
-def standardix(products_file, mapping_file):
+# ==========================================================
+# 3. LOGIQUE SPÉCIFIQUE MESURES (pouces / cm)
+#    → inspiré de standardize_measurements.py
+# ==========================================================
+
+# Alias de valeurs pour détecter les unités en texte libre
+UNIT_ALIASES = {
+    "in": ["in", "inch", "inches", '"', "po", "pouce", "pouces"],
+    "ft": ["ft", "foot", "feet", "'"],
+    "cm": ["cm", "centimeter", "centimeters", "centimètre", "centimètres"],
+    "mm": ["mm", "millimeter", "millimeters", "millimètre", "millimètres"],
+    "m": ["m", "meter", "meters", "mètre", "mètres"],
+}
+
+
+def detect_inline_unit(text: str):
+    """Essaie de détecter l'unité dans une chaîne libre (in, po, cm, etc.)."""
+    t = text.strip()
+    tl = t.lower()
+    # Si ' et " apparaissent → très probablement pied-pouce, mais on va traiter en pouces
+    if ("'" in t) and ('"' in t):
+        return "ft"
+    for canon, aliases in UNIT_ALIASES.items():
+        for a in aliases:
+            if a in ["'", '"']:
+                if a in t:
+                    return canon
+            else:
+                if re.search(rf'\b{re.escape(a)}\b', tl, flags=re.IGNORECASE):
+                    return canon
+    return None
+
+
+def remove_units_case_insensitive(text: str):
+    """Retire les tokens d'unités connus (mots et symboles) sans tenir compte de la casse."""
+    t = text
+    for canon, aliases in UNIT_ALIASES.items():
+        for a in aliases:
+            if a in ["'", '"']:
+                t = t.replace(a, "")
+            else:
+                t = re.sub(rf'\b{re.escape(a)}\b', '', t, flags=re.IGNORECASE)
+    return t
+
+
+def clean_numeric_part(text: str, keep_spaces=False):
+    """
+    - Remplace la virgule par un point
+    - Retire les unités (mots/symboles)
+    - Normalise les espaces
+    """
+    t = text.strip().replace(",", ".")
+    t = remove_units_case_insensitive(t)
+    if keep_spaces:
+        t = re.sub(r"\s+", " ", t)
+    else:
+        t = re.sub(r"\s+", "", t)
+    return t
+
+
+def parse_feet_inches_pattern(raw_text: str):
+    """
+    Parse des formes du type :
+    - 6'
+    - 4' 3-1/2"
+    - 4 ft 3.25 in
+    Renvoie la valeur en pouces (float) ou None si non reconnu.
+    """
+    s = raw_text.strip().replace(",", ".")
+    s = re.sub(r"\s+", " ", s)
+
+    # pieds seuls: 6' ou 6 ft
+    m = re.match(r"^(-?\d+)\s*(?:'|ft)\s*$", s, flags=re.IGNORECASE)
+    if m:
+        ft = int(m.group(1))
+        return ft * 12.0
+
+    # pieds + pouces décimaux: 4' 3.25" ou 4 ft 3.25 in
+    m = re.match(r"^(-?\d+)\s*(?:'|ft)\s*(\d+(?:\.\d+)?)\s*(?:\"|in)\s*$", s, flags=re.IGNORECASE)
+    if m:
+        ft = int(m.group(1))
+        inches = float(m.group(2))
+        return ft * 12.0 + inches
+
+    # pieds + pouces fractionnaires: 4' 3-1/2"
+    m = re.match(r"^(-?\d+)\s*(?:'|ft)\s*(\d+)-(\d+)\/(\d+)\s*(?:\"|in)\s*$", s, flags=re.IGNORECASE)
+    if m:
+        ft = int(m.group(1))
+        whole_in = int(m.group(2))
+        num = int(m.group(3))
+        den = int(m.group(4))
+        return ft * 12.0 + (whole_in + num / den)
+
+    return None
+
+
+def parse_value_to_inches(value_str, unit_hint=None):
+    """
+    Parse décimales, fractions, mixtes, pied-pouce.
+    Renvoie la valeur en pouces (float) ou None.
+    """
+    if value_str is None or str(value_str).strip() == "":
+        return None
+
+    raw = str(value_str)
+
+    # 1) Essai des formats pied-pouce
+    fi = parse_feet_inches_pattern(raw)
+    if fi is not None:
+        return fi
+
+    # 2) Détection de l'unité
+    inline_unit = detect_inline_unit(raw)
+    unit = inline_unit or (unit_hint.lower().strip() if isinstance(unit_hint, str) else None)
+
+    # 3) Mixed fraction : "8 37/64" ou "8-37/64"
+    t_mixed = clean_numeric_part(raw, keep_spaces=True)
+    m = re.match(r"^(-?\d+)[\-\s](\d+)\/(\d+)$", t_mixed)
+    if m:
+        whole = int(m.group(1))
+        num = int(m.group(2))
+        den = int(m.group(3))
+        val = whole + (num / den if whole >= 0 else -num / den)
+    else:
+        # 4) Fraction simple : "3/16"
+        t = clean_numeric_part(raw, keep_spaces=False)
+        m2 = re.match(r"^(-?\d+)\/(\d+)$", t)
+        if m2:
+            num = int(m2.group(1))
+            den = int(m2.group(2))
+            val = num / den
+        else:
+            # 5) Décimal ou entier
+            try:
+                val = float(t)
+            except Exception:
+                return None
+
+    # 6) Conversion vers pouces
+    if unit is None or unit == "in":
+        inches = val
+    elif unit == "ft":
+        inches = val * 12.0
+    elif unit == "cm":
+        inches = val / 2.54
+    elif unit == "mm":
+        inches = val / 25.4
+    elif unit == "m":
+        inches = val * 39.37007874
+    else:
+        inches = val  # défaut : on considère que c'est déjà en pouces
+
+    return inches
+
+
+def round_to_sixteenth(inches):
+    """Arrondit à la 1/16e de pouce la plus proche."""
+    if inches is None:
+        return None
+    if isinstance(inches, float) and (math.isnan(inches) or math.isinf(inches)):
+        return None
+    return round(inches * 16) / 16
+
+
+def inches_to_mixed_fraction(inches):
+    """Transforme un nombre de pouces en entier + fraction (limité au 1/16e)."""
+    if inches is None:
+        return 0, 0, 1
+    sign = -1 if inches < 0 else 1
+    x = abs(inches)
+    whole = int(math.floor(x + 1e-9))
+    frac = x - whole
+    frac_fraction = Fraction(frac).limit_denominator(16)
+    num = frac_fraction.numerator
+    den = frac_fraction.denominator
+    if num == den:
+        whole += 1
+        num = 0
+    whole *= sign
+    return whole, num, den
+
+
+def format_fraction_entier_trait_d_union(whole, num, den):
+    """Formate 1 + 1/4 → '1-1/4', 0 + 3/16 → '3/16'."""
+    if num == 0:
+        return f"{whole}"
+    return f"{whole}-{num}/{den}" if whole != 0 else f"{num}/{den}"
+
+
+def format_decimal(value, locale="EN", places=2):
+    """
+    Arrondi HALF_UP avec Decimal, puis:
+    - EN : séparateur .
+    - FR : séparateur ,
+    """
+    q = Decimal(str(value)).quantize(Decimal("0." + "0" * places), rounding=ROUND_HALF_UP)
+    if q == q.to_integral():
+        s = f"{int(q)}"
+    else:
+        s = f"{q:.{places}f}"
+    if locale.upper() == "FR":
+        s = s.replace(".", ",")
+    return s
+
+
+def render_output(inches_rounded, mode_format, add_unit, unit_final,
+                  locale="EN", dec_places=2):
+    """
+    Rend la chaîne finale selon les options :
+    - mode_format: 'fraction' ou 'decimale'
+    - unit_final: 'in', 'cm', 'les deux'
+    - dec_places: nb de décimales pour les cm et les pouces décimaux
+    """
+    # Gestion des valeurs invalides / manquantes
+    if inches_rounded is None:
+        return ""
+    if isinstance(inches_rounded, float) and (math.isnan(inches_rounded) or math.isinf(inches_rounded)):
+        return ""
+
+    # ----- Partie pouces -----
+    if mode_format == "fraction":
+        w, n, d = inches_to_mixed_fraction(inches_rounded)
+        inch_side = format_fraction_entier_trait_d_union(w, n, d)
+    else:
+        inch_side = format_decimal(inches_rounded, locale=locale, places=dec_places)
+
+    if add_unit and unit_final in ["in", "les deux"]:
+        inch_unit = "in" if locale.upper() == "EN" else "po"
+        inch_side = f"{inch_side} {inch_unit}"
+
+    # ----- Partie cm -----
+    cm_val = inches_rounded * 2.54
+    cm_str = format_decimal(cm_val, locale=locale, places=dec_places)
+    cm_side = cm_str
+    if add_unit and unit_final in ["cm", "les deux"]:
+        cm_side = f"{cm_side} cm"
+
+    # ----- Combinaison finale -----
+    if unit_final == "in":
+        return inch_side
+    elif unit_final == "cm":
+        return cm_side
+    else:
+        # "les deux"
+        return f"{inch_side} ({cm_side})"
+
+
+def is_measurement_match_type(mt) -> bool:
+    """
+    Détermine si un match_type indique une standardisation 'pouces/cm'.
+    Exemples supportés :
+      - in-po-inch-pouce
+      - in
+      - inch
+      - pouce
+      - po
+      (toutes variantes casse / séparateurs)
+    """
+    if mt is None or (isinstance(mt, float) and pd.isna(mt)):
+        return False
+
+    s = str(mt).strip().lower()
+    if not s:
+        return False
+
+    # On découpe sur tout ce qui n'est pas une lettre
+    tokens = re.split(r"[^a-z]+", s)
+    tokens = [t for t in tokens if t]
+
+    measurement_tokens = {"in", "inch", "inches", "po", "pouce", "pouces"}
+    return any(t in measurement_tokens for t in tokens)
+
+
+def standardize_measurement_series(series, options):
+    """
+    Standardise une série de valeurs de mesures :
+    - valeurs vides → vide
+    - valeurs non parseables → UNDEFINITE / NON_MAPPÉ
+    - valeurs valides → 'pouces en fraction (cm)' ou autre selon options
+    """
+    mode_format = options.get("mode_format", "fraction")  # 'fraction' ou 'decimale'
+    dec_places = int(options.get("dec_places", 2))
+    add_unit = bool(options.get("add_unit", True))
+    unit_final = options.get("unit_final", "les deux")
+    if unit_final not in ["in", "cm", "les deux"]:
+        unit_final = "les deux"
+
+    out_en = []
+    out_fr = []
+
+    for v in series:
+        # Valeur vide → vide
+        if pd.isna(v) or (isinstance(v, str) and v.strip() == ""):
+            out_en.append("")
+            out_fr.append("")
+            continue
+
+        inches = parse_value_to_inches(v, unit_hint=None)
+        if inches is None:
+            out_en.append("UNDEFINITE")
+            out_fr.append("NON_MAPPÉ")
+            continue
+
+        inches_rounded = round_to_sixteenth(inches)
+        if inches_rounded is None:
+            out_en.append("UNDEFINITE")
+            out_fr.append("NON_MAPPÉ")
+            continue
+
+        en_str = render_output(
+            inches_rounded,
+            mode_format=mode_format,
+            add_unit=add_unit,
+            unit_final=unit_final,
+            locale="EN",
+            dec_places=dec_places,
+        )
+        fr_str = render_output(
+            inches_rounded,
+            mode_format=mode_format,
+            add_unit=add_unit,
+            unit_final=unit_final,
+            locale="FR",
+            dec_places=dec_places,
+        )
+
+        out_en.append(en_str)
+        out_fr.append(fr_str)
+
+    return out_en, out_fr
+
+
+# ==========================================================
+# 4. FONCTION PRINCIPALE standardix
+# ==========================================================
+
+def standardix(products_file, mapping_file, measure_options=None):
     """
     Point d'entrée principal :
     - products_file : CSV/XLSX fournisseur
     - mapping_file : CSV/XLSX mapping
+    - measure_options : dict pour la standardisation des mesures, ex :
+        {
+            "mode_format": "fraction" ou "decimale",
+            "dec_places": 2,
+            "add_unit": True,
+            "unit_final": "les deux",
+        }
+
     Renvoie deux DataFrames : df_en, df_fr.
     """
+    if measure_options is None:
+        measure_options = {
+            "mode_format": "fraction",   # fraction par défaut
+            "dec_places": 2,             # 2 décimales pour cm / décimal
+            "add_unit": True,
+            "unit_final": "les deux",    # pouces + cm
+        }
+
     # Lecture des fichiers
     df_products = read_table(products_file)
     df_map = read_table(mapping_file)
@@ -128,11 +496,23 @@ def standardix(products_file, mapping_file):
             # Attribut présent dans le mapping mais pas dans le fichier produits
             continue
 
-        exact_en, exact_fr, regex_rules = build_rules(df_map, attr)
-        std_en, std_fr = apply_rules(df_products[src_col], exact_en, exact_fr, regex_rules)
+        # Sous-ensemble du mapping pour cet attribut
+        attr_rows = df_map[df_map["attribute"] == attr]
+
+        # 1) Faut-il utiliser la logique de mesures ?
+        has_measurement = any(is_measurement_match_type(mt) for mt in attr_rows["match_type"])
+
+        if has_measurement:
+            # 🔹 MODE MESURES (pouces/cm)
+            std_en, std_fr = standardize_measurement_series(df_products[src_col], measure_options)
+        else:
+            # 🔹 MODE CLASSIQUE (exact / regex)
+            exact_en, exact_fr, regex_rules = build_rules(df_map, attr)
+            std_en, std_fr = apply_rules(df_products[src_col], exact_en, exact_fr, regex_rules)
 
         # 🔹 On nomme les colonnes standard à partir du NOM RÉEL de la colonne produit
         df_en[f"{src_col}_standard_en"] = std_en
         df_fr[f"{src_col}_standard_fr"] = std_fr
 
     return df_en, df_fr
+
