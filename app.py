@@ -239,7 +239,7 @@ def build_short_description_for_row(row: pd.Series, recipes: pd.DataFrame, attr_
     return text
 
 
-def process_language(standardized_df: pd.DataFrame, recipes_df: pd.DataFrame, lang_label: str) -> pd.DataFrame:
+def process_language(standardized_df: pd.DataFrame, recipes: pd.DataFrame, lang_label: str) -> pd.DataFrame:
     """
     Applique les recettes pour une langue donnée.
     """
@@ -251,7 +251,7 @@ def process_language(standardized_df: pd.DataFrame, recipes_df: pd.DataFrame, la
 
     out_rows = []
     for _, row in standardized_df.iterrows():
-        short_desc = build_short_description_for_row(row, recipes_df, attr_lookup)
+        short_desc = build_short_description_for_row(row, recipes, attr_lookup)
         row_out = {
             COL_SKU: row[COL_SKU],
             COL_PRODUCT_TYPE: row[COL_PRODUCT_TYPE],
@@ -298,89 +298,162 @@ if tool == "Standardiser les attributs":
         key="mapping_std",
     )
 
-    if st.button("Lancer la standardisation"):
+    # --- Bouton en haut + placeholders juste en dessous ---
+    start_standardization = st.button("Lancer la standardisation")
+    status_placeholder = st.empty()
+    download_placeholder = st.empty()
+
+    # --- Texte & options de standardisation des mesures ---
+    st.markdown(
+        """
+**Standardisation des mesures (pouces / cm)**  
+
+Les mesures, s'il y en a à votre fichier, seront standardisées par défaut en **pouces en fraction (cm)**,  
+par exemple : `1-1/4 po (3,18 cm)`.
+        """
+    )
+
+    show_advanced_measures = st.checkbox(
+        "Afficher les options avancées pour les mesures (pouces / centimètres)"
+    )
+
+    # Valeurs par défaut : fraction + 2 décimales + pouces + cm
+    measure_options = {
+        "mode_format": "fraction",   # 'fraction' ou 'decimale'
+        "dec_places": 2,             # nb de décimales pour cm / pouces décimaux
+        "add_unit": True,
+        "unit_final": "les deux",    # pouces + cm par défaut
+    }
+
+    if show_advanced_measures:
+        format_pouces = st.selectbox(
+            "Format des pouces",
+            options=[
+                "Fraction (ex. 1-1/4)",
+                "Décimal (ex. 1,25)",
+            ],
+            index=0,
+        )
+        if "Décimal" in format_pouces:
+            measure_options["mode_format"] = "decimale"
+        else:
+            measure_options["mode_format"] = "fraction"
+
+        dec_places = st.number_input(
+            "Nombre de chiffres après la virgule pour les cm et les pouces en décimales",
+            min_value=0,
+            max_value=4,
+            value=2,
+            step=1,
+        )
+        measure_options["dec_places"] = int(dec_places)
+
+        # Unité finale : pouces / cm / les deux
+        unite_finale = st.selectbox(
+            "Unité finale des mesures",
+            options=[
+                "Pouces + centimètres",
+                "Seulement pouces",
+                "Seulement centimètres",
+            ],
+            index=0,
+        )
+        if "Seulement pouces" in unite_finale:
+            measure_options["unit_final"] = "in"
+        elif "Seulement centimètres" in unite_finale:
+            measure_options["unit_final"] = "cm"
+        else:
+            measure_options["unit_final"] = "les deux"
+
+    if start_standardization:
         if uploaded_products and uploaded_mapping:
 
-            # 1) Standardisation → DataFrames EN / FR
-            df_en, df_fr = standardix(uploaded_products, uploaded_mapping)
+            with st.spinner("Standardisation en cours..."):
+                # 1) Standardisation → DataFrames EN / FR
+                df_en, df_fr = standardix(
+                    uploaded_products,
+                    uploaded_mapping,
+                    measure_options=measure_options,
+                )
 
-            # 2) Lire le fichier fournisseur pour récupérer l'ordre initial
-            df_products = read_table(uploaded_products)
-            original_cols = list(df_products.columns)
+                # 2) Lire le fichier fournisseur pour récupérer l'ordre initial
+                df_products = read_table(uploaded_products)
+                original_cols = list(df_products.columns)
 
-            # 3) Réordonner les colonnes standardisées :
-            #    -> elles suivent l'ordre des colonnes d'origine
-            std_cols_en = []
-            for col in original_cols:
-                cand = f"{col}_standard_en"
-                if cand in df_en.columns:
-                    std_cols_en.append(cand)
-            df_en = df_en[original_cols + std_cols_en]
+                # 3) Réordonner les colonnes standardisées :
+                #    -> elles suivent l'ordre des colonnes d'origine
+                std_cols_en = []
+                for col in original_cols:
+                    cand = f"{col}_standard_en"
+                    if cand in df_en.columns:
+                        std_cols_en.append(cand)
+                df_en = df_en[original_cols + std_cols_en]
 
-            std_cols_fr = []
-            for col in original_cols:
-                cand = f"{col}_standard_fr"
-                if cand in df_fr.columns:
-                    std_cols_fr.append(cand)
-            df_fr = df_fr[original_cols + std_cols_fr]
+                std_cols_fr = []
+                for col in original_cols:
+                    cand = f"{col}_standard_fr"
+                    if cand in df_fr.columns:
+                        std_cols_fr.append(cand)
+                df_fr = df_fr[original_cols + std_cols_fr]
 
-            # 4) Écriture dans un Excel en mémoire
-            buffer = BytesIO()
-            with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-                df_en.to_excel(writer, sheet_name="EN", index=False)
-                df_fr.to_excel(writer, sheet_name="FR", index=False)
+                # 4) Écriture dans un Excel en mémoire
+                buffer = BytesIO()
+                with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+                    df_en.to_excel(writer, sheet_name="EN", index=False)
+                    df_fr.to_excel(writer, sheet_name="FR", index=False)
 
-            buffer.seek(0)
+                buffer.seek(0)
 
-            # 5) Recharger le fichier pour colorer les en-têtes
-            wb = load_workbook(buffer)
+                # 5) Recharger le fichier pour colorer les en-têtes
+                wb = load_workbook(buffer)
 
-            green_fill = PatternFill(start_color="00C6EFCE", end_color="00C6EFCE", fill_type="solid")
-            red_fill = PatternFill(start_color="00FFC7CE", end_color="00FFC7CE", fill_type="solid")
+                green_fill = PatternFill(start_color="00C6EFCE", end_color="00C6EFCE", fill_type="solid")
+                red_fill = PatternFill(start_color="00FFC7CE", end_color="00FFC7CE", fill_type="solid")
 
-            # Colonnes qui ne doivent jamais être en rouge
-            never_red = {"sku", "Short Description"}
+                # Colonnes qui ne doivent jamais être en rouge
+                never_red = {"sku", "Short Description"}
 
-            # ---------- FEUILLE EN ----------
-            ws_en = wb["EN"]
+                # ---------- FEUILLE EN ----------
+                ws_en = wb["EN"]
 
-            for col_idx, col_name in enumerate(df_en.columns, start=1):
+                for col_idx, col_name in enumerate(df_en.columns, start=1):
 
-                # 1) Colonne standardisée → VERT
-                if col_name.endswith("_standard_en"):
-                    ws_en.cell(row=1, column=col_idx).fill = green_fill
-                    continue
+                    # 1) Colonne standardisée → VERT
+                    if col_name.endswith("_standard_en"):
+                        ws_en.cell(row=1, column=col_idx).fill = green_fill
+                        continue
 
-                # 2) Colonne d’origine → ROUGE SEULEMENT SI elle n’a pas été standardisée
-                if col_name in original_cols and col_name not in never_red:
-                    std_version = f"{col_name}_standard_en"
-                    if std_version not in df_en.columns:
-                        ws_en.cell(row=1, column=col_idx).fill = red_fill
+                    # 2) Colonne d’origine → ROUGE SEULEMENT SI elle n’a pas été standardisée
+                    if col_name in original_cols and col_name not in never_red:
+                        std_version = f"{col_name}_standard_en"
+                        if std_version not in df_en.columns:
+                            ws_en.cell(row=1, column=col_idx).fill = red_fill
 
-            # ---------- FEUILLE FR ----------
-            ws_fr = wb["FR"]
+                # ---------- FEUILLE FR ----------
+                ws_fr = wb["FR"]
 
-            for col_idx, col_name in enumerate(df_fr.columns, start=1):
+                for col_idx, col_name in enumerate(df_fr.columns, start=1):
 
-                # 1) Colonne standardisée → VERT
-                if col_name.endswith("_standard_fr"):
-                    ws_fr.cell(row=1, column=col_idx).fill = green_fill
-                    continue
+                    # 1) Colonne standardisée → VERT
+                    if col_name.endswith("_standard_fr"):
+                        ws_fr.cell(row=1, column=col_idx).fill = green_fill
+                        continue
 
-                # 2) Colonne d’origine → ROUGE SEULEMENT SI elle n’a pas été standardisée
-                if col_name in original_cols and col_name not in never_red:
-                    std_version = f"{col_name}_standard_fr"
-                    if std_version not in df_fr.columns:
-                        ws_fr.cell(row=1, column=col_idx).fill = red_fill
+                    # 2) Colonne d’origine → ROUGE SEULEMENT SI elle n’a pas été standardisée
+                    if col_name in original_cols and col_name not in never_red:
+                        std_version = f"{col_name}_standard_fr"
+                        if std_version not in df_fr.columns:
+                            ws_fr.cell(row=1, column=col_idx).fill = red_fill
 
-            # 6) Sauvegarde finale
-            output = BytesIO()
-            wb.save(output)
-            output.seek(0)
+                # 6) Sauvegarde finale
+                output = BytesIO()
+                wb.save(output)
+                output.seek(0)
 
-            st.success("✅ Standardisation terminée. Vous pouvez télécharger le fichier.")
+            # ✅ Message + bouton apparaissent juste sous le bouton
+            status_placeholder.success("✅ Standardisation terminée. Vous pouvez télécharger le fichier.")
 
-            st.download_button(
+            download_placeholder.download_button(
                 "📥 Télécharger le fichier standardisé (Excel)",
                 data=output,
                 file_name="products_standardized.xlsx",
@@ -388,7 +461,7 @@ if tool == "Standardiser les attributs":
             )
 
         else:
-            st.error("Veuillez téléverser les deux fichiers (fournisseur et mapping).")
+            status_placeholder.error("Veuillez téléverser les deux fichiers (fournisseur et mapping).")
 
 # --------------------------------------------------
 # OUTIL 2 – GÉNÉRATION DES DESCRIPTIONS COURTES
@@ -488,5 +561,4 @@ else:
 
             except Exception as e:
                 st.error(f"Une erreur est survenue : {e}")
-
 
