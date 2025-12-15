@@ -5,6 +5,12 @@ from openpyxl import load_workbook
 from openpyxl.styles import PatternFill
 import unicodedata
 from typing import Optional, List, Dict
+import sys
+import subprocess
+import json
+from urllib.parse import urljoin, urlparse
+import requests
+from bs4 import BeautifulSoup
 
 from standardix_engine import standardix, read_table
 
@@ -269,6 +275,525 @@ def process_language(standardized_df: pd.DataFrame, recipes: pd.DataFrame, lang_
 # CONFIG STREAMLIT GÉNÉRALE
 # --------------------------------------------------
 
+# ------------------------------------------------------------
+# Helpers (HTTP)
+# ------------------------------------------------------------
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    )
+}
+
+
+def http_get(url: str, timeout: int = 30) -> requests.Response:
+    r = requests.get(url, headers=HEADERS, timeout=timeout, allow_redirects=True)
+    r.raise_for_status()
+    return r
+
+
+def abs_url(base: str, href: str) -> str:
+    return urljoin(base, href)
+
+
+def normalize_image_url(u: str) -> str:
+    return (u or "").replace("&amp;", "&").strip()
+
+
+def image_dedupe_key(u: str) -> str:
+    return (u or "").split("?", 1)[0].strip()
+
+
+def best_from_srcset(srcset: str) -> str:
+    if not srcset:
+        return ""
+    parts = [p.strip() for p in srcset.split(",") if p.strip()]
+    if not parts:
+        return ""
+    return parts[-1].split(" ")[0].strip()
+
+
+def img_tag_to_url(img, base_url: str) -> str:
+    src = (img.get("src") or "").strip()
+    if src:
+        return abs_url(base_url, src)
+    srcset = (img.get("srcset") or "").strip()
+    if srcset:
+        return abs_url(base_url, best_from_srcset(srcset))
+    dsrc = (img.get("data-src") or "").strip()
+    if dsrc:
+        return abs_url(base_url, dsrc)
+    dsrcset = (img.get("data-srcset") or "").strip()
+    if dsrcset:
+        return abs_url(base_url, best_from_srcset(dsrcset))
+    return ""
+
+
+# ------------------------------------------------------------
+# Playwright helpers
+# ------------------------------------------------------------
+def ensure_playwright_chromium_installed():
+    """
+    Install chromium if Playwright is present but browsers are missing (Streamlit Cloud).
+    Runs at most once per app session.
+    """
+    if st.session_state.get("_pw_chromium_installed_ok") is True:
+        return
+    if st.session_state.get("_pw_chromium_installed_attempted"):
+        return
+
+    st.session_state["_pw_chromium_installed_attempted"] = True
+    subprocess.run(
+        [sys.executable, "-m", "playwright", "install", "chromium"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    st.session_state["_pw_chromium_installed_ok"] = True
+
+
+def _launch_browser(p):
+    """Launch Chromium, auto-install if missing."""
+    try:
+        return p.chromium.launch(headless=True)
+    except Exception as e:
+        msg = str(e)
+        if "Executable doesn't exist" in msg or "playwright install" in msg:
+            ensure_playwright_chromium_installed()
+            return p.chromium.launch(headless=True)
+        raise
+
+
+def get_rendered_html_playwright(url: str, wait_ms: int = 600) -> str:
+    """Render a page with Playwright and return its HTML."""
+    from playwright.sync_api import sync_playwright  # type: ignore
+
+    with sync_playwright() as p:
+        browser = _launch_browser(p)
+        context = browser.new_context(user_agent=HEADERS["User-Agent"])
+
+        # Speed: block heavy resources (we only need DOM + attributes)
+        def _route(route, request):
+            if request.resource_type in ("image", "media", "font"):
+                return route.abort()
+            return route.continue_()
+
+        context.route("**/*", _route)
+
+        page = context.new_page()
+        page.goto(url, wait_until="domcontentloaded", timeout=90000)
+        page.wait_for_timeout(wait_ms)
+        html = page.content()
+        browser.close()
+        return html
+
+
+# ------------------------------------------------------------
+# PLP extraction (product list)
+# ------------------------------------------------------------
+_PRODUCT_PATH_HINTS = (
+    "/products/",  # Shopify + many
+    "/product/",   # Rapha and others
+)
+
+
+def _same_origin(base_url: str, candidate_url: str) -> bool:
+    try:
+        b = urlparse(base_url)
+        c = urlparse(candidate_url)
+        return (b.scheme, b.netloc) == (c.scheme, c.netloc)
+    except Exception:
+        return False
+
+
+def _looks_like_product_href(href: str) -> bool:
+    h = (href or "").lower()
+    if any(x in h for x in ("onetrust", "cookie", "consent", "privacy", "terms")):
+        return False
+    return any(p in h for p in _PRODUCT_PATH_HINTS)
+
+
+def plp_products_requests(plp_url: str, max_products: int) -> list[dict]:
+    """Extract product_name + product_url from a PLP HTML (no JS)."""
+    base = f"{urlparse(plp_url).scheme}://{urlparse(plp_url).netloc}"
+    html = http_get(plp_url).text
+    soup = BeautifulSoup(html, "html.parser")
+
+    products: list[dict] = []
+    seen: set[str] = set()
+
+    # Prefer links inside <main> if present (reduces cookie links)
+    root = soup.find("main") or soup
+
+    for a in root.find_all("a", href=True):
+        href = (a.get("href") or "").strip()
+        if not href:
+            continue
+        if not _looks_like_product_href(href):
+            continue
+
+        pdp = abs_url(base, href.split("?")[0])
+        if not _same_origin(plp_url, pdp):
+            continue
+        if pdp in seen:
+            continue
+
+        # Ensure it's likely a product card: link has an image inside
+        if not a.find("img"):
+            continue
+
+        name = a.get_text(" ", strip=True) or a.get("aria-label") or a.get("title") or ""
+        name = (name or "").strip()
+
+        seen.add(pdp)
+        products.append({"product_name": name, "product_url": pdp})
+        if len(products) >= max_products:
+            break
+
+    return products
+
+
+def plp_products_playwright(plp_url: str, max_products: int) -> list[dict]:
+    """Extract product_name + product_url from a PLP using rendered DOM (Playwright)."""
+    base = f"{urlparse(plp_url).scheme}://{urlparse(plp_url).netloc}"
+    from playwright.sync_api import sync_playwright  # type: ignore
+
+    with sync_playwright() as p:
+        browser = _launch_browser(p)
+        context = browser.new_context(user_agent=HEADERS["User-Agent"])
+
+        # Speed: block heavy resources
+        def _route(route, request):
+            if request.resource_type in ("image", "media", "font"):
+                return route.abort()
+            return route.continue_()
+
+        context.route("**/*", _route)
+
+        page = context.new_page()
+        page.goto(plp_url, wait_until="domcontentloaded", timeout=90000)
+
+        # Some PLPs load items on scroll
+        for _ in range(5):
+            page.mouse.wheel(0, 2200)
+            page.wait_for_timeout(450)
+
+        js = r"""
+        () => {
+          const bad = ['onetrust','cookie','consent','privacy','terms'];
+          const hints = ['/products/','/product/'];
+
+          function isBadHref(h){
+            const s = (h||'').toLowerCase();
+            return bad.some(b => s.includes(b));
+          }
+          function looksLikeProduct(h){
+            const s = (h||'');
+            return hints.some(x => s.includes(x));
+          }
+
+          const anchors = Array.from(document.querySelectorAll('main a[href], a[href]'));
+          const out = [];
+          for(const a of anchors){
+            const href = a.getAttribute('href') || '';
+            if(!href) continue;
+            if(isBadHref(href)) continue;
+            if(!looksLikeProduct(href)) continue;
+
+            // must contain an image (product tile)
+            if(!a.querySelector('img')) continue;
+
+            const txt = (a.innerText || '').trim();
+            const aria = a.getAttribute('aria-label') || '';
+            const title = a.getAttribute('title') || '';
+            const imgAlt = (a.querySelector('img')?.getAttribute('alt') || '').trim();
+
+            out.push({
+              href,
+              text: txt,
+              aria,
+              title,
+              imgAlt
+            });
+          }
+          return out;
+        }
+        """
+        items = page.evaluate(js) or []
+        browser.close()
+
+    products: list[dict] = []
+    seen: set[str] = set()
+
+    for it in items:
+        href = (it.get("href") or "").strip()
+        if not href:
+            continue
+        pdp = abs_url(base, href.split("?")[0])
+        if not _same_origin(plp_url, pdp):
+            continue
+        if pdp in seen:
+            continue
+
+        # Prefer image alt for name (Rapha often has it), else aria/title/text
+        name = (it.get("imgAlt") or "").strip() or (it.get("aria") or "").strip() or (it.get("title") or "").strip() or (it.get("text") or "").strip()
+        name = name.strip()
+
+        seen.add(pdp)
+        products.append({"product_name": name, "product_url": pdp})
+        if len(products) >= max_products:
+            break
+
+    return products
+
+
+# ------------------------------------------------------------
+# PDP image extraction (product-only)
+# ------------------------------------------------------------
+def images_from_jsonld_product(html: str, base_url: str) -> list[str]:
+    soup = BeautifulSoup(html, "html.parser")
+    urls: list[str] = []
+
+    for tag in soup.find_all("script", {"type": "application/ld+json"}):
+        txt = tag.get_text(strip=True)
+        if not txt:
+            continue
+        try:
+            obj = json.loads(txt)
+        except Exception:
+            continue
+
+        nodes = obj if isinstance(obj, list) else [obj]
+        i = 0
+        while i < len(nodes):
+            n = nodes[i]
+            i += 1
+            if not isinstance(n, dict):
+                continue
+
+            if "@graph" in n and isinstance(n["@graph"], list):
+                nodes.extend([x for x in n["@graph"] if isinstance(x, dict)])
+                continue
+
+            t = n.get("@type")
+            is_product = ("Product" in t) if isinstance(t, list) else (t == "Product")
+            if not is_product:
+                continue
+
+            img = n.get("image")
+            if isinstance(img, str):
+                urls.append(abs_url(base_url, img))
+            elif isinstance(img, list):
+                for x in img:
+                    if isinstance(x, str):
+                        urls.append(abs_url(base_url, x))
+                    elif isinstance(x, dict) and x.get("url"):
+                        urls.append(abs_url(base_url, x["url"]))
+            elif isinstance(img, dict) and img.get("url"):
+                urls.append(abs_url(base_url, img["url"]))
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for u in urls:
+        u = normalize_image_url(u)
+        key = image_dedupe_key(u)
+        if key and key not in seen:
+            seen.add(key)
+            out.append(u)
+    return out
+
+
+def images_from_dom_gallery_playwright(pdp_url: str) -> list[str]:
+    """
+    Render PDP and extract product gallery images only.
+    Priority:
+      1) Swiper slides (Pas Normal uses swiper-slide for gallery)
+      2) Common gallery/media containers
+      3) Fallback to <main> but blacklist "also bought"/related areas
+    """
+    from playwright.sync_api import sync_playwright  # type: ignore
+
+    with sync_playwright() as p:
+        browser = _launch_browser(p)
+        context = browser.new_context(user_agent=HEADERS["User-Agent"])
+
+        # Speed: block heavy resources
+        def _route(route, request):
+            if request.resource_type in ("image", "media", "font"):
+                return route.abort()
+            return route.continue_()
+
+        context.route("**/*", _route)
+
+        page = context.new_page()
+        page.goto(pdp_url, wait_until="domcontentloaded", timeout=90000)
+        page.wait_for_timeout(400)
+
+        js = r"""
+        () => {
+          const black = ['recommend','also','related','upsell','cross','carousel','brand','logo','footer','header','nav','newsletter','review','rating'];
+          function isBad(el){
+            let cur = el;
+            for(let i=0;i<12 && cur;i++){
+              const s = ((cur.id||'')+' '+(cur.className||'')).toLowerCase();
+              if(black.some(b => s.includes(b))) return true;
+              cur = cur.parentElement;
+            }
+            return false;
+          }
+          function pickUrl(img){
+            const src = img.getAttribute('src') || '';
+            if(src) return src;
+            const srcset = img.getAttribute('srcset') || img.getAttribute('data-srcset') || '';
+            if(srcset){
+              const parts = srcset.split(',').map(x=>x.trim()).filter(Boolean);
+              if(parts.length) return parts[parts.length-1].split(' ')[0].trim();
+            }
+            const dsrc = img.getAttribute('data-src') || '';
+            if(dsrc) return dsrc;
+            return '';
+          }
+          function okSize(img){
+            const w = parseInt(img.getAttribute('width')||'0',10);
+            const h = parseInt(img.getAttribute('height')||'0',10);
+            if((w && w < 250) || (h && h < 250)) return false;
+            return true;
+          }
+
+          const urls = [];
+          const seen = new Set();
+
+          // 1) Swiper gallery (preferred when present)
+          // Many PDPs use Swiper both for product media and for recommendations.
+          // We pick the *best* swiper container by scoring large images.
+          const mainEl = document.querySelector('main') || document;
+          const allSwiperImgs = Array.from(mainEl.querySelectorAll('.swiper-slide img'));
+          if(allSwiperImgs.length){
+            const groups = new Map(); // root -> {score, urls}
+            function rootFor(img){
+              return img.closest('.swiper') || img.closest('.swiper-wrapper') || img.closest('[class*="swiper"]') || img.parentElement;
+            }
+            for(const img of allSwiperImgs){
+              if(isBad(img)) continue;
+              if(!okSize(img)) continue;
+              const u = pickUrl(img);
+              if(!u) continue;
+              const key = u.split('?')[0];
+
+              const root = rootFor(img);
+              if(!root) continue;
+              if(!groups.has(root)) groups.set(root, {score: 0, urls: [], seen: new Set()});
+              const g = groups.get(root);
+
+              if(g.seen.has(key)) continue;
+              g.seen.add(key);
+
+              // score by declared width/height when available (bigger usually = product gallery)
+              const w = parseInt(img.getAttribute('width')||'0',10);
+              const h = parseInt(img.getAttribute('height')||'0',10);
+              const area = (w>0 && h>0) ? (w*h) : 1;
+              g.score += area;
+              g.urls.push(u);
+            }
+
+            // pick best group by score, then by count
+            let best = null;
+            for(const g of groups.values()){
+              if(!best) best = g;
+              else if(g.score > best.score) best = g;
+              else if(g.score === best.score && g.urls.length > best.urls.length) best = g;
+            }
+            if(best && best.urls.length){
+              for(const u of best.urls){
+                const key = u.split('?')[0];
+                if(seen.has(key)) continue;
+                seen.add(key);
+                urls.push(u);
+              }
+              if(urls.length >= 2) return urls;
+            }
+          }
+
+          // 2) Common gallery containers
+          const selectors = [
+            '[data-product-media]',
+            '[data-product-gallery]',
+            '[data-testid*="gallery"]',
+            '[data-testid*="product-media"]',
+            '[class*="ProductGallery"]',
+            '[class*="product-gallery"]',
+            '[class*="gallery"]',
+            '[class*="Gallery"]',
+            '[class*="media"]',
+            '[class*="Media"]'
+          ];
+          let root = null;
+          for(const sel of selectors){
+            const el = document.querySelector(sel);
+            if(el){ root = el; break; }
+          }
+          if(!root) root = document.querySelector('main') || document;
+
+          const imgs = Array.from(root.querySelectorAll('img'));
+          for(const img of imgs){
+            if(isBad(img)) continue;
+            if(!okSize(img)) continue;
+            const u = pickUrl(img);
+            if(!u) continue;
+            const key = u.split('?')[0];
+            if(seen.has(key)) continue;
+            seen.add(key);
+            urls.push(u);
+          }
+          return urls;
+        }
+        """
+        urls = page.evaluate(js) or []
+        browser.close()
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for u in urls:
+        au = urljoin(pdp_url, u)
+        au = normalize_image_url(au)
+        key = image_dedupe_key(au)
+        if key and key not in seen:
+            seen.add(key)
+            out.append(au)
+    return out
+
+
+def extract_product_images(pdp_url: str) -> list[str]:
+    """
+    Product-only images:
+      1) JSON-LD Product
+      2) Rendered DOM gallery (swiper/gallery) via Playwright
+    """
+    html = ""
+    try:
+        html = http_get(pdp_url).text
+    except Exception:
+        html = ""
+
+    imgs = images_from_jsonld_product(html, pdp_url) if html else []
+
+    if len(imgs) < 2:
+        imgs = images_from_dom_gallery_playwright(pdp_url)
+
+    # Final dedupe
+    out: list[str] = []
+    seen: set[str] = set()
+    for u in imgs:
+        u = normalize_image_url(u)
+        key = image_dedupe_key(u)
+        if key and key not in seen:
+            seen.add(key)
+            out.append(u)
+    return out
+
+
+
+
 st.set_page_config(page_title="Standardix", layout="wide")
 
 st.title("Standardix – Outils eCommerce")
@@ -278,6 +803,7 @@ tool = st.sidebar.radio(
     [
         "Standardiser les attributs",
         "Générer des descriptions courtes",
+        "Extraire les images produits",
     ],
 )
 
@@ -466,7 +992,7 @@ par exemple : `1-1/4 po (3,18 cm)`.
 # --------------------------------------------------
 # OUTIL 2 – GÉNÉRATION DES DESCRIPTIONS COURTES
 # --------------------------------------------------
-else:
+elif tool == "Générer des descriptions courtes":
     st.header("✏️ Générer des descriptions courtes")
 
     st.markdown(
@@ -562,3 +1088,125 @@ else:
             except Exception as e:
                 st.error(f"Une erreur est survenue : {e}")
 
+# ---------------- Tool 3
+else:
+    st.header("🖼️ Extraire les images produits")
+
+    authorized = st.checkbox(
+        "Je confirme disposer de l’autorisation du fournisseur pour extraire et utiliser les images de ses produits."
+    )
+
+    plp_url = st.text_input("URL de la page source des produits", placeholder="https://exemple.com/collections/produits")
+    st.caption(
+        "Inscrivez l’URL de la page fournisseur contenant la liste des produits (ex. page de collection ou catégorie, PLP)."
+    )
+
+    max_products = st.number_input("Nombre maximum de produits à traiter", min_value=1, max_value=300, value=150, step=1)
+
+    if st.button("Extraire", disabled=(not authorized)):
+        if not plp_url or not plp_url.startswith(("http://", "https://")):
+            st.error("Veuillez fournir une URL valide (http/https).")
+            st.stop()
+
+        # Progress: X/Y only + message by ratio
+        progress = st.progress(0)
+        status = st.empty()
+
+        def phase_message(done: int, total_items: int) -> str:
+            if total_items <= 0:
+                return "Traitement…"
+            ratio = done / total_items
+            if ratio <= 0.25:
+                return "Récupérer les nom des produits"
+            elif ratio <= 0.50:
+                return "Récupérer les URL des produits"
+            elif ratio <= 0.75:
+                return "Récupérer les url des images principales"
+            else:
+                return "Récupérer les url des images additionnelles"
+
+        def update(done: int, total_items: int):
+            pct = int((done / total_items) * 100) if total_items else 0
+            progress.progress(min(max(pct, 0), 100))
+            status.text(f"{done}/{total_items} — {phase_message(done, total_items)}")
+
+        requested_total = int(max_products)
+
+        # Step A: product list (requests first, then Playwright)
+        products: list[dict] = []
+        try:
+            products = plp_products_requests(plp_url, max_products=requested_total)
+        except Exception:
+            products = []
+
+        if not products:
+            try:
+                products = plp_products_playwright(plp_url, max_products=requested_total)
+            except Exception as e:
+                st.error(
+                    "Impossible de récupérer la liste des produits sur cette page. "
+                    "Il se peut qu'elle charge le contenu via JavaScript ou bloque l'automatisation."
+                )
+                st.error(f"Une erreur est survenue : {e}")
+                st.stop()
+
+        products = products[:requested_total]
+        total_items = len(products)
+        if total_items == 0:
+            st.error("Aucun produit détecté.")
+            st.stop()
+
+        update(0, total_items)
+
+        # Step B: iterate products and extract product-only images
+        rows: list[dict] = []
+        for idx, pr in enumerate(products, start=1):
+            product_name = (pr.get("product_name") or "").strip()
+            product_url = (pr.get("product_url") or "").strip()
+
+            # fallback name
+            if not product_name:
+                product_name = product_url.rsplit("/", 1)[-1].replace("-", " ").strip()
+
+            # Extract images
+            try:
+                img_urls = extract_product_images(product_url)
+            except Exception:
+                img_urls = []
+
+            # Shopify: one row per image
+            alt_text = product_name
+            for pos, img in enumerate(img_urls, start=1):
+                rows.append(
+                    {
+                        "Product name": product_name,
+                        "Product URL": product_url,
+                        "Product image URL": img,
+                        "Image position": pos,
+                        "Image alt text": alt_text,
+                    }
+                )
+
+            update(idx, total_items)
+
+        if not rows:
+            st.error(
+                "Aucune image produit trouvée. (Le site peut bloquer l'accès ou les images sont rendues uniquement via JavaScript)"
+            )
+            st.stop()
+
+        df = pd.DataFrame(
+            rows,
+            columns=["Product name", "Product URL", "Product image URL", "Image position", "Image alt text"],
+        )
+
+        buffer = BytesIO()
+        with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+            df.to_excel(writer, index=False, sheet_name="Images")
+
+        st.download_button(
+            "Télécharger le fichier Excel",
+            data=buffer.getvalue(),
+            file_name="product_images.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
