@@ -1,6 +1,6 @@
-
 import streamlit as st
 import pandas as pd
+import re
 from io import BytesIO
 from openpyxl import load_workbook
 from openpyxl.styles import PatternFill
@@ -76,6 +76,19 @@ def normalize_string(x: Optional[str]) -> str:
     return str(x).strip()
 
 
+def clean_spaces(text: Optional[str]) -> str:
+    """
+    Nettoie les espaces dans une string:
+      - remplace 2+ espaces/tab/retours par 1 seul espace
+      - retire les espaces au début/à la fin
+    """
+    if text is None:
+        return ""
+    s = str(text)
+    s = re.sub(r"\s{2,}", " ", s)
+    return s.strip()
+
+
 def strip_accents(s: str) -> str:
     s = normalize_string(s)
     nfkd = unicodedata.normalize("NFD", s)
@@ -108,6 +121,10 @@ def load_recipes(df: pd.DataFrame, sheet_name: str) -> pd.DataFrame:
     for col in required_cols:
         if col not in df.columns:
             raise ValueError(f"Missing required column '{col}' in sheet '{sheet_name}'")
+
+    # separator_before (optionnel) : mêmes règles que separator_after
+    if "separator_before" not in df.columns:
+        df["separator_before"] = ""
 
     # Colonne brand facultative
     if "brand" not in df.columns:
@@ -209,6 +226,7 @@ def build_short_description_for_row(row: pd.Series, recipes: pd.DataFrame, attr_
     for _, rec in applicable.iterrows():
         source_type_raw = rec["source_type"]
         attr_name = rec["attribute_name"]
+        sep_before_raw = rec.get("separator_before", "")
         sep_raw = rec["separator_after"]
 
         try:
@@ -228,6 +246,12 @@ def build_short_description_for_row(row: pd.Series, recipes: pd.DataFrame, attr_
             continue
 
         value_str = str(value).strip()
+
+        # Séparateur BEFORE : ajouté seulement si on a déjà du contenu avant
+        sep_before = resolve_separator(sep_before_raw)
+        if sep_before and parts:
+            parts.append(sep_before)
+
         parts.append(value_str)
 
         sep = resolve_separator(sep_raw)
@@ -242,7 +266,8 @@ def build_short_description_for_row(row: pd.Series, recipes: pd.DataFrame, attr_
     if last.strip() in {",", ":", "-", ".", "•"}:
         parts = parts[:-1]
 
-    text = "".join(str(p) for p in parts).strip()
+    text = "".join(str(p) for p in parts)
+    text = clean_spaces(text)
     return text
 
 
