@@ -105,6 +105,102 @@ def apply_rules(series, exact_en, exact_fr, regex_rules):
 
 
 # ==========================================================
+# 2b. Fallback via Short Description (exact / exact + "'s")
+# ==========================================================
+
+def _canon_shortdesc(text):
+    """Normalise une short description pour la recherche (minuscule, espaces normalisés)."""
+    if text is None or (isinstance(text, float) and pd.isna(text)):
+        return ""
+    s = str(text).strip().lower()
+    # normalise espaces
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+
+def build_shortdesc_exact_patterns(exact_source_norms):
+    """
+    Compile des patterns regex pour détecter des matches EXACTS dans la short description:
+    - source
+    - source + "'s" (ou "’s")
+    Le match est "standalone" (bornes non-alphanum).
+    """
+    patterns = []
+    for base in exact_source_norms:
+        if not base:
+            continue
+        base = str(base).strip().lower()
+        if not base:
+            continue
+        # (?<!\w) ... (?!\w) empêche de matcher au milieu d'un mot
+        pat = re.compile(r"(?<!\w)" + re.escape(base) + r"(?:'s|’s)?(?!\w)")
+        patterns.append((pat, base))
+    return patterns
+
+
+def infer_source_norm_from_shortdesc(short_desc, compiled_patterns):
+    """Retourne la clé (source_norm) à utiliser si un pattern match, sinon None."""
+    s = _canon_shortdesc(short_desc)
+    if not s:
+        return None
+    for pat, base in compiled_patterns:
+        if pat.search(s):
+            return base
+    return None
+
+
+def apply_rules_with_shortdesc_fallback(series, short_desc_series, exact_en, exact_fr, regex_rules):
+    """
+    Variante de apply_rules:
+    - Si la cellule est vide dans la colonne attribut,
+      on tente de détecter un match exact (ou exact + "'s") dans Short Description
+      par rapport à la colonne 'source' du mapping (match_type='exact').
+    - Si trouvé, on utilise directement standard_en / standard_fr correspondants.
+    - Sinon, même comportement que apply_rules.
+    """
+    out_en = []
+    out_fr = []
+
+    # patterns basés sur les clés exactes déjà normalisées
+    compiled_patterns = build_shortdesc_exact_patterns(list(exact_en.keys()))
+
+    for i, v in enumerate(series):
+        # 🔹 Valeurs vides → tenter fallback short description
+        if pd.isna(v) or (isinstance(v, str) and v.strip() == ""):
+            sd = None
+            if short_desc_series is not None and i < len(short_desc_series):
+                sd = short_desc_series.iloc[i]
+            inferred = infer_source_norm_from_shortdesc(sd, compiled_patterns) if compiled_patterns else None
+
+            if inferred is not None:
+                en = exact_en.get(inferred)
+                fr = exact_fr.get(inferred)
+                out_en.append(en if en is not None else "UNDEFINITE")
+                out_fr.append(fr if fr is not None else "NON_MAPPÉ")
+            else:
+                out_en.append("")
+                out_fr.append("")
+            continue
+
+        norm = clean_text(v)
+        en = exact_en.get(norm)
+        fr = exact_fr.get(norm)
+
+        # 🔹 Si pas de match exact → tester les regex
+        if en is None and norm:
+            for pattern, sen, sfr in regex_rules:
+                if pattern.fullmatch(norm):
+                    en, fr = sen, sfr
+                    break
+
+        # 🔹 Valeur présente mais non trouvée dans le mapping
+        out_en.append(en if en is not None else "UNDEFINITE")
+        out_fr.append(fr if fr is not None else "NON_MAPPÉ")
+
+    return out_en, out_fr
+
+
+# ==========================================================
 # 3. LOGIQUE SPÉCIFIQUE MESURES (pouces / cm)
 # ==========================================================
 
@@ -502,6 +598,10 @@ def standardix(products_file, mapping_file, measure_options=None):
     product_cols = list(df_products.columns)
     col_lookup = {c.strip().lower(): c for c in product_cols}
 
+    # 🔹 Colonne Short Description (fallback si valeur vide)
+    _sd_col = col_lookup.get("short description")
+    short_desc_series = df_products[_sd_col] if _sd_col else None
+
     # 🔹 Attributs dynamiques : viennent du mapping
     attribute_names = sorted(df_map["attribute"].dropna().unique())
 
@@ -531,7 +631,7 @@ def standardix(products_file, mapping_file, measure_options=None):
         else:
             # 🔹 MODE CLASSIQUE (exact / regex)
             exact_en, exact_fr, regex_rules = build_rules(df_map, attr)
-            std_en, std_fr = apply_rules(df_products[src_col], exact_en, exact_fr, regex_rules)
+            std_en, std_fr = apply_rules_with_shortdesc_fallback(df_products[src_col], short_desc_series, exact_en, exact_fr, regex_rules)
 
         # 🔹 On nomme les colonnes standard à partir du NOM RÉEL de la colonne produit
         df_en[f"{src_col}_standard_en"] = std_en
