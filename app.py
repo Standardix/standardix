@@ -1,6 +1,5 @@
 import streamlit as st
 import pandas as pd
-import re
 from io import BytesIO
 from openpyxl import load_workbook
 from openpyxl.styles import PatternFill
@@ -74,19 +73,6 @@ def normalize_string(x: Optional[str]) -> str:
     if x is None:
         return ""
     return str(x).strip()
-
-
-def clean_spaces(text: Optional[str]) -> str:
-    """
-    Nettoie les espaces dans une string:
-      - remplace 2+ espaces/tab/retours par 1 seul espace
-      - retire les espaces au début/à la fin
-    """
-    if text is None:
-        return ""
-    s = str(text)
-    s = re.sub(r"\s{2,}", " ", s)
-    return s.strip()
 
 
 def strip_accents(s: str) -> str:
@@ -266,8 +252,7 @@ def build_short_description_for_row(row: pd.Series, recipes: pd.DataFrame, attr_
     if last.strip() in {",", ":", "-", ".", "•"}:
         parts = parts[:-1]
 
-    text = "".join(str(p) for p in parts)
-    text = clean_spaces(text)
+    text = "".join(str(p) for p in parts).strip()
     return text
 
 
@@ -1138,6 +1123,10 @@ else:
         progress = st.progress(0)
         status = st.empty()
 
+
+        # Phase 0: analyse de la page (petit segment bleu)
+        progress.progress(2)
+        status.text("Analyse de la page…")
         def phase_message(done: int, total_items: int) -> str:
             if total_items <= 0:
                 return "Traitement…"
@@ -1182,7 +1171,9 @@ else:
             st.error("Aucun produit détecté.")
             st.stop()
 
-        update(0, total_items)
+        # Fin de l’analyse: on repart avec la barre de progression "classique"
+        progress.progress(0)
+        status.text(f"0/{total_items} — Démarrage…")
 
         # Step B: iterate products and extract product-only images
         rows: list[dict] = []
