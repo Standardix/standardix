@@ -124,17 +124,36 @@ def build_shortdesc_exact_patterns(exact_source_norms):
     - source
     - source + "'s" (ou "’s")
     Le match est "standalone" (bornes non-alphanum).
+
+    ✅ Correctifs:
+      1) Prioriser les termes PLUS LONGS d'abord (ex: "2x-large" avant "large")
+      2) Empêcher les tailles 1 lettre (S/M/L) de matcher dans "Men's" / "Women's"
+         (apostrophe avant le S)
     """
     patterns = []
-    for base in exact_source_norms:
-        if not base:
-            continue
+
+    # ✅ Prioriser les sources les plus longues d'abord
+    bases = [b for b in exact_source_norms if b]
+    bases = sorted(bases, key=lambda x: len(str(x)), reverse=True)
+
+    for base in bases:
         base = str(base).strip().lower()
         if not base:
             continue
+
+        # ✅ Cas spécial: base d'une seule lettre (ex: "s")
+        # - Empêche de matcher après ' ou ’ (ex: Men’s)
+        # - Toujours "standalone" (pas au milieu d'un mot)
+        if len(base) == 1:
+            pat = re.compile(r"(?<![\w'’])" + re.escape(base) + r"(?!\w)")
+            patterns.append((pat, base))
+            continue
+
+        # Cas normal: autorise éventuellement "'s" / "’s" après le mot trouvé
         # (?<!\w) ... (?!\w) empêche de matcher au milieu d'un mot
         pat = re.compile(r"(?<!\w)" + re.escape(base) + r"(?:'s|’s)?(?!\w)")
         patterns.append((pat, base))
+
     return patterns
 
 
@@ -631,7 +650,13 @@ def standardix(products_file, mapping_file, measure_options=None):
         else:
             # 🔹 MODE CLASSIQUE (exact / regex)
             exact_en, exact_fr, regex_rules = build_rules(df_map, attr)
-            std_en, std_fr = apply_rules_with_shortdesc_fallback(df_products[src_col], short_desc_series, exact_en, exact_fr, regex_rules)
+            std_en, std_fr = apply_rules_with_shortdesc_fallback(
+                df_products[src_col],
+                short_desc_series,
+                exact_en,
+                exact_fr,
+                regex_rules
+            )
 
         # 🔹 On nomme les colonnes standard à partir du NOM RÉEL de la colonne produit
         df_en[f"{src_col}_standard_en"] = std_en
